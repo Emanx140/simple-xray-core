@@ -1,111 +1,132 @@
-# Скрипт для лёгкой установки и настройки ядра X-ray без графического интерфейса
+# simple-xray-core
 
-Вы все знакомы с такими панелями управления, как 3x-ui, Marzban и другими. Все эти панели являются всего лишь графическими надстройками над ядром X-ray и служат для удобного управления им, а также для создания подключений и настроек. Ядро же может работать без всяких панелей и управляться полностью через терминал. Основное преимущество использования «голого» ядра заключается в том, что вам не нужно заморачиваться с доменами и TLS-сертификатами. Само ядро можно установить и администрировать вручную с помощью официальной документации. Этот скрипт предназначен для упрощения этой задачи: он автоматически установит ядро на сервер, создаст конфигурационные файлы и несколько исполняемых файлов для удобного управления пользователями.
+Установка Xray без панели и управление клиентами через терминал. Текущая конфигурация использует **VLESS + XHTTP + REALITY**, TCP 443, путь `/api/v1/sync`, режим `stream-up`, SNI `github.com` и отпечаток `firefox` в ссылках.
 
-## VPS для панели
+Поддерживаются Ubuntu 22.04/24.04 и Debian с systemd, Python 3.10 или новее. Скрипт устанавливает Python и остальные зависимости через apt. Полная установка на новом VPS ещё требует проверки; команды управления проверяются отдельно на копии рабочей конфигурации.
 
-Для установки панели нам понадобится VPS-сервер. Приобрести его можно в [ishosting](https://bit.ly/3rOqvPE).  
-В сервисе доступны более 36 локаций. Если вам не нужна какая-то конкретная страна, выбирайте ту, что ближе к вам.
+## Установка на новом VPS
 
-## Системные требования
+Скачайте репозиторий и запустите установщик от root:
 
-- 1 CPU  
-- 1 GB RAM  
-- 10 GB диска  
-- ОС Ubuntu 22 x64 или Ubuntu 24 x64
-
-## Как пользоваться скриптом
-
-Скрипт создавался и тестировался под ОС Ubuntu 22 x64 и Ubuntu 24 x64. На других ОС может работать некорректно. Чтобы скачать и запустить скрипт, используйте эту команду:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/ServerTechnologies/simple-xray-core/refs/heads/main/xray-install | bash
+```bash
+git clone https://github.com/Emanx140/simple-xray-core.git
+cd simple-xray-core
+sudo bash xray-install --address NEW_SERVER_IP
 ```
 
-## Команды для управления пользователями
+Или скачайте один Bash-скрипт. Он сам загрузит вспомогательные файлы из этого репозитория:
 
-**Вывести список всех клиентов:**
-
-```sh
-userlist
+```bash
+curl -fL https://raw.githubusercontent.com/Emanx140/simple-xray-core/main/xray-install -o /tmp/xray-install
+sudo bash /tmp/xray-install --address NEW_SERVER_IP
 ```
 
-**Вывести ссылку и QR-код для подключения основного пользователя:**
+Замените `NEW_SERVER_IP` публичным IP нового VPS или вашим DNS-именем. Установщик получает последнюю стабильную версию Xray через [официальный установщик](https://github.com/XTLS/Xray-install). Для фиксированной версии добавьте `--version v26.3.27`.
 
-```sh
-mainuser
+При новой установке создаются новый UUID, ключ REALITY и short ID. Правила из `config.example.json` блокируют `geosite:category-ads-all` и назначения `geoip:ru`, как в исходной конфигурации. Это серверные правила: трафик к таким назначениям блокируется, а не направляется напрямую с устройства.
+
+Установщик отказывается перезаписывать существующий `/usr/local/etc/xray/config.json`. Для обновления только команд используйте `--tools-only`. Обновление ядра существующего сервера выполняйте отдельно после резервного копирования и проверки совместимости.
+
+## Перенос с существующего сервера
+
+### Через приватную копию
+
+На исходном сервере с установленными новыми командами:
+
+```bash
+sudo xray-backup /root/xray-config.json
 ```
 
-**Создать нового пользователя:**
+Если команды ещё старые, можно скопировать активный файл напрямую:
 
-```sh
-newuser
+```bash
+sudo install -m 600 /usr/local/etc/xray/config.json /root/xray-config.json
 ```
 
-**Удалить пользователя:**
+Перенесите файл через SCP/SFTP на новый VPS, вне Git-репозитория, и выполните там:
 
-```sh
-rmuser
+```bash
+sudo bash xray-install --config /root/xray-config.json --address NEW_SERVER_IP
 ```
 
-**Создать ссылку для подключения:**
+Файл содержит все UUID клиентов, приватный ключ REALITY, short ID, транспорт и маршрутизацию. Держите его приватным. Файл `.keys` старого скрипта больше не используется: источником данных является активный `config.json`.
 
-```sh
-sharelink
+### Одной командой с нового VPS
+
+```bash
+sudo bash xray-install --from root@OLD_SERVER --address NEW_SERVER_IP
 ```
 
-В домашней папке пользователя будет создан файл `help` — в нём содержатся подсказки с описанием команд. Посмотреть его можно с помощью команды (нужно находиться в домашней папке пользователя):
+Скрипт прочитает активный `config.json` по SSH. Поддерживаются обычные SSH-ключи, интерактивный ввод пароля и SSH-алиасы. Для другого порта настройте `Port` в `/root/.ssh/config`. Для автоматического запуска заранее настройте SSH-ключ и проверьте ключ хоста. Пароли не передавайте аргументами и не сохраняйте в репозитории.
 
-```sh
-cat help
+Оба варианта сохраняют клиентов и ключи, но устанавливают актуальное ядро и геоданные. IP в ссылках берётся из `--address`, а SNI остаётся именем REALITY-цели. Если клиенты подключаются по IP, импортируйте новые ссылки или измените адрес профиля. Если используется ваш DNS, обновите его запись после проверки нового сервера.
+
+Миграция поддерживает текущую схему с одним VLESS/REALITY inbound и без внешних сертификатов. Она не копирует настройки SSH, системный cron, Apache, Hysteria, сетевые интерфейсы и старые правила firewall. Дополнительные файлы нестандартной конфигурации нужно переносить отдельно. Конфигурация с конкретным IP в `listen` требует ручной адаптации приватной копии; wildcard `0.0.0.0` менять не нужно.
+
+## Команды
+
+Запускайте от root или через `sudo`.
+
+| Команда | Действие |
+| --- | --- |
+| `userlist` | Список клиентов из активной конфигурации |
+| `mainuser` | Ссылка клиента с именем `main` |
+| `mainuser --qr` | Ссылка и QR-код |
+| `newuser alice` | Создать клиента, проверить конфигурацию, перезапустить Xray, вывести ссылку |
+| `newuser` | Запросить имя интерактивно |
+| `sharelink alice --qr` | Ссылка и QR-код выбранного клиента |
+| `sharelink` | Выбрать клиента из списка |
+| `sharelink alice --address NEW_SERVER_IP` | Ссылка с другим адресом без изменения сохранённых настроек |
+| `rmuser alice` | Удалить клиента после подтверждения |
+| `rmuser alice --yes` | Удалить клиента без дополнительного вопроса |
+| `xray-backup /root/xray-config.json` | Сохранить приватную копию, не перезаписывая существующий файл |
+
+Все ссылки используют действительные UUID, порт, SNI, short ID, путь и режим транспорта. Публичный ключ вычисляется из действительного приватного ключа. Параметры URL кодируются. XHTTP-клиенты создаются без Vision flow; TCP/raw сохраняет единый flow существующих клиентов.
+
+Перед изменением клиентов команда сохраняет резервную копию и проверяет кандидат через `xray run -test`. При неудачном перезапуске восстанавливается предыдущая конфигурация. Изменения сериализуются блокировкой, права владельца и группы сохраняются. Перезапуск прерывает текущие соединения.
+
+Вспомогательные команды поддерживают XHTTP и TCP/raw с REALITY. Они останавливаются с ошибкой при неподдерживаемых VLESS Encryption, ML-DSA, Finalmask или отдельных XHTTP extra/download settings, чтобы не выдавать неполные ссылки.
+
+## Обновить только команды на текущем сервере
+
+```bash
+sudo bash xray-install --tools-only --address CURRENT_SERVER_IP
 ```
 
-## Полезные ссылки
+Этот режим заменяет команды, сохраняет их предыдущие версии в `/root/xray-tools-backup.*` и обновляет адрес в `/usr/local/etc/xray/share-settings.json`. Он не меняет активную конфигурацию, не обновляет ядро и не перезапускает Xray.
 
-- [GitHub проекта X-ray Core](https://github.com/XTLS/Xray-core)
-- [Официальная документация на русском](https://xtls.github.io/ru/)
+## Проверка после переноса
 
-## Клиенты для подключения
-
-**Windows**
-
-- [v2rayN](https://github.com/2dust/v2rayN)  
-- [Furious](https://github.com/LorenEteval/Furious)  
-- [Invisible Man - Xray](https://github.com/InvisibleManVPN/InvisibleMan-XRayClient)  
-
-**Android**
-
-- [v2rayNG](https://github.com/2dust/v2rayNG)  
-- [X-flutter](https://github.com/XTLS/X-flutter)  
-- [SaeedDev94/Xray](https://github.com/SaeedDev94/Xray)  
-
-**iOS & macOS arm64**
-
-- [Streisand](https://apps.apple.com/app/streisand/id6450534064)  
-- [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215)  
-- [OneXray](https://github.com/OneXray/OneXray)  
-
-**macOS arm64 & x64**
-
-- [V2rayU](https://github.com/yanue/V2rayU)  
-- [V2RayXS](https://github.com/tzmax/V2RayXS)  
-- [Furious](https://github.com/LorenEteval/Furious)  
-- [OneXray](https://github.com/OneXray/OneXray)  
-
-**Linux**
-
-- [Nekoray](https://github.com/MatsuriDayo/nekoray)  
-- [v2rayA](https://github.com/v2rayA/v2rayA)  
-- [Furious](https://github.com/LorenEteval/Furious)  
-
-## Если вдруг нужно удалить, то воспользуйтесь этими командами:
-```sh
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove
-rm /usr/local/etc/xray/config.json
-rm /usr/local/etc/xray/.keys
-rm /usr/local/bin/userlist
-rm /usr/local/bin/mainuser
-rm /usr/local/bin/newuser
-rm /usr/local/bin/rmuser
-rm /usr/local/bin/sharelink
+```bash
+sudo xray run -test -config /usr/local/etc/xray/config.json
+sudo systemctl status xray --no-pager
+sudo ss -lntp 'sport = :443'
+sudo journalctl -u xray -n 30 --no-pager
+sudo mainuser --qr
 ```
+
+При активном UFW установщик добавляет порт Xray. Также разрешите TCP 443 в firewall провайдера. Скрипт не включает UFW и не меняет доступ по SSH. BBR включается только если ядро VPS уже сообщает о его поддержке.
+
+Завершите проверку реальным подключением из клиента, например v2rayN или Happ, из вашей домашней и мобильной сети. Работающий systemd-сервис и открытый порт ещё не подтверждают доступность VPN с этих сетей. Старый VPS оставьте доступным до успешной проверки.
+
+## Автоматизация
+
+После создания VPS будущий worker сможет загрузить приватный конфиг и выполнить:
+
+```bash
+bash xray-install --config /root/xray-config.json --address "$NEW_SERVER_IP"
+```
+
+Или использовать `--from` при настроенном SSH-доступе к исходному серверу. Создание VPS через API провайдера пока не входит в этот репозиторий.
+
+Для установки из конкретной ветки или коммита скачивайте `xray-install` по этому ref и передайте такой же `XRAY_SETUP_REF`, чтобы вспомогательные файлы соответствовали скрипту:
+
+```bash
+sudo env XRAY_SETUP_REF=COMMIT_SHA bash /tmp/xray-install --config /root/xray-config.json --address NEW_SERVER_IP
+```
+
+## Источники
+
+- [Xray-core](https://github.com/XTLS/Xray-core)
+- [Официальный установщик](https://github.com/XTLS/Xray-install)
+- [Стандарт VLESS share links](https://github.com/XTLS/Xray-core/discussions/716)

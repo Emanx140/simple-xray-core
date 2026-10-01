@@ -17,7 +17,7 @@
         "ip": [
           "geoip:ru"
         ],
-        "outboundTag": "block"
+        "outboundTag": "direct"
       }
     ]
   },

@@ -2,17 +2,19 @@
 """Manage the single VLESS/REALITY inbound used by simple-xray-core."""
 import argparse
 import fcntl
+import hashlib
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 import uuid
 
 CONFIG = Path('/usr/local/etc/xray/config.json')
@@ -98,6 +100,35 @@ def show_link(link, qr):
         subprocess.run(['qrencode', '-t', 'ANSIUTF8', link], check=True)
 
 
+def subscription_base(value):
+    uri = urlsplit(value)
+    if uri.scheme != 'https' or not uri.hostname or uri.username or uri.password or uri.query or uri.fragment or uri.path not in ('', '/'):
+        raise ValueError('Subscription URL must be an HTTPS website origin, e.g. https://example.com')
+    address(uri.hostname)
+    if uri.port is not None and not 1 <= uri.port <= 65535:
+        raise ValueError('Invalid subscription port')
+    return value.rstrip('/')
+
+
+def subscription_token(settings, client):
+    tokens = settings.setdefault('subscriptionTokens', {})
+    token = tokens.get(client['id'])
+    if token is None:
+        token = secrets.token_hex(32)
+        tokens[client['id']] = token
+        write_settings(settings)
+    if not re.fullmatch(r'[a-f0-9]{64}', token):
+        raise ValueError('Invalid saved subscription token')
+    return token
+
+
+def client_link(config, client, host, settings, subscription):
+    if subscription:
+        base = subscription_base(settings.get('subscriptionUrl', ''))
+        return f"{base}/sub/{subscription_token(settings, client)}"
+    return share_link(config, client, host, settings.get('fingerprint', 'firefox'))
+
+
 def save_change(config):
     original = CONFIG.stat()
     with tempfile.NamedTemporaryFile(dir=CONFIG.parent, suffix='.json', mode='w', delete=False) as handle:
@@ -140,22 +171,178 @@ def select_client(clients, name):
     return clients[choice - 1]
 
 
+def profile_template(config, settings):
+    sample = {'id': '00000000-0000-4000-8000-000000000000', 'email': 'template'}
+    item = inbound(config)
+    if item['streamSettings']['network'] in ('tcp', 'raw'):
+        flows = {c.get('flow', '') for c in item['settings']['clients']}
+        if len(flows) > 1:
+            raise ValueError('Mixed TCP flows cannot be managed as one fleet')
+        sample['flow'] = next(iter(flows), 'xtls-rprx-vision')
+    return share_link(config, sample, settings['address'], settings.get('fingerprint', 'firefox'))
+
+
+def admin_json(config):
+    """Fixed SSH command. All user input arrives as bounded JSON on stdin."""
+    request = json.loads(sys.stdin.read(2097153))
+    if not isinstance(request, dict) or len(json.dumps(request)) > 2097152:
+        raise ValueError('Invalid admin request')
+    action = request.get('action')
+    if action not in ('list', 'create', 'update', 'delete', 'snapshot', 'apply', 'validate', 'reboot'):
+        raise ValueError('Invalid admin action')
+    def revision():
+        return hashlib.sha256(CONFIG.read_bytes() + (SETTINGS.read_bytes() if SETTINGS.exists() else b'')).hexdigest()
+    if action not in ('list', 'snapshot', 'apply', 'validate', 'reboot') and request.get('revision') != revision():
+        raise ValueError('Users changed on the VPS. Sync users before trying again.')
+    settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    if action == 'reboot':
+        run('systemd-run', '--quiet', '--collect', '--on-active=5s', '--timer-property=AccuracySec=1s',
+            '--unit=xray-admin-reboot-' + uuid.uuid4().hex, '/usr/bin/systemctl', 'reboot')
+        print(json.dumps({'scheduled': True}))
+        return
+    if action == 'validate':
+        desired, desired_settings = request.get('config'), request.get('settings')
+        if not isinstance(desired, dict) or not isinstance(desired_settings, dict):
+            raise ValueError('Missing configuration or share settings')
+        item = inbound(desired)
+        for entry in desired.get('inbounds', []):
+            if entry.get('listen', '0.0.0.0') not in ('0.0.0.0', '::', '127.0.0.1', '::1'):
+                raise ValueError('Configuration has a source-specific listen address')
+        clients = item['settings']['clients']
+        ids = [c['id'] for c in clients]
+        if len(ids) > 512 or len(set(ids)) != len(ids):
+            raise ValueError('Invalid or duplicate clients')
+        for value in ids:
+            uuid.UUID(value)
+        with tempfile.NamedTemporaryFile(dir=CONFIG.parent, suffix='.json', mode='w') as handle:
+            json.dump(desired, handle)
+            handle.flush()
+            run('xray', 'run', '-test', '-config', handle.name)
+        old_tokens = desired_settings.get('subscriptionTokens', {})
+        desired_settings['subscriptionTokens'] = {value: old_tokens.get(value) or secrets.token_hex(32) for value in ids}
+        print(json.dumps({'config': desired, 'settings': desired_settings,
+                          'profileTemplate': profile_template(desired, desired_settings)}))
+        return
+    if action == 'apply':
+        desired = request.get('config')
+        desired_settings = request.get('settings')
+        if not isinstance(desired, dict) or not isinstance(desired_settings, dict):
+            raise ValueError('Missing desired configuration')
+        inbound(desired)
+        for item in desired.get('inbounds', []):
+            if item.get('listen', '0.0.0.0') not in ('0.0.0.0', '::', '127.0.0.1', '::1'):
+                raise ValueError('Configuration has a source-specific listen address')
+        desired_settings['address'] = str(ipaddress.ip_address(request.get('address', '')))
+        reboot = request.get('rebootUtc', '04:00')
+        if not isinstance(reboot, str) or not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]', reboot):
+            raise ValueError('Invalid UTC reboot time')
+        # Validate before changing either persisted file. Identical retries do not restart Xray.
+        if config != desired:
+            save_change(desired)
+        write_settings(desired_settings)
+        configure_reboot(reboot)
+        run('systemctl', 'enable', 'xray')
+        run('systemctl', 'start', 'xray')
+        run('systemctl', 'is-active', '--quiet', 'xray')
+        print(json.dumps({'revision': revision(), 'applied': True}))
+        return
+    host = str(ipaddress.ip_address(settings.get('address', '')))
+    clients = inbound(config)['settings']['clients']
+    if action in ('create', 'update'):
+        name = request.get('name')
+        if not isinstance(name, str) or not name or len(name) > 100 or any(c.isspace() or ord(c) < 32 for c in name):
+            raise ValueError('Use a name of 1-100 characters without whitespace or control characters')
+        if any(c.get('email') == name and (action == 'create' or c['id'] != request.get('id')) for c in clients):
+            raise ValueError('Client name already exists')
+    if action == 'create':
+        if len(clients) >= 512:
+            raise ValueError('Maximum of 512 clients reached')
+        client = {'email': name, 'id': str(uuid.uuid4())}
+        if inbound(config)['streamSettings']['network'] in ('tcp', 'raw'):
+            flows = {c.get('flow', '') for c in clients}
+            if len(flows) > 1:
+                raise ValueError('Mixed TCP client flows; configure the new client manually')
+            client['flow'] = next(iter(flows), 'xtls-rprx-vision')
+        clients.append(client)
+    elif action in ('update', 'delete'):
+        matches = [c for c in clients if c['id'] == request.get('id')]
+        if len(matches) != 1:
+            raise ValueError('Client no longer exists. Sync users again.')
+        client = matches[0]
+        if action == 'delete':
+            clients.remove(client)
+        else:
+            client['email'] = name
+            if not isinstance(request.get('rotate', False), bool):
+                raise ValueError('Invalid credential rotation option')
+            if request.get('rotate', False):
+                # Keep the subscription URL stable when its VLESS UUID changes.
+                token = subscription_token(settings, client)
+                client['id'] = str(uuid.uuid4())
+                settings['subscriptionTokens'][client['id']] = token
+                # Persist through the same private atomic writer used by token creation.
+                write_settings(settings)
+    exported = {'address': host, 'clients': [
+        {'name': c.get('email') or c['id'], 'token': subscription_token(settings, c),
+         'link': share_link(config, c, host, settings.get('fingerprint', 'firefox'))}
+        for c in clients
+    ]}
+    if action not in ('list', 'snapshot'):
+        save_change(config)
+    exported['revision'] = revision()
+    exported['subscriptionUrl'] = settings.get('subscriptionUrl', '')
+    if action == 'snapshot':
+        exported.update(config=config, settings=settings,
+                        profileTemplate=profile_template(config, settings))
+    print(json.dumps(exported))
+
+
+def configure_reboot(utc_time):
+    script = Path('/usr/local/sbin/xray-daily-reboot')
+    script.write_text('#!/bin/sh\n[ "$(date -u +%H:%M)" = "' + utc_time + '" ] || exit 0\nexec /usr/bin/systemctl reboot\n')
+    script.chmod(0o700)
+    cron = Path('/etc/cron.d/xray-daily-reboot')
+    cron.write_text('SHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root /usr/local/sbin/xray-daily-reboot\n')
+    cron.chmod(0o644)
+    run('systemctl', 'enable', '--now', 'cron')
+
+
+def write_settings(settings):
+    with tempfile.NamedTemporaryFile(dir=SETTINGS.parent, mode='w', delete=False) as handle:
+        temporary = Path(handle.name)
+        json.dump(settings, handle, indent=2)
+        handle.write('\n')
+    try:
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, SETTINGS)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     command = Path(sys.argv[0]).name
     if command == 'xray-manage':
-        parser.add_argument('command', choices=['userlist', 'mainuser', 'sharelink', 'newuser', 'rmuser', 'xray-backup'])
+        parser.add_argument('command', choices=['userlist', 'mainuser', 'sharelink', 'newuser', 'rmuser', 'xray-backup', 'xray-subscription-export', 'admin-json'])
     parser.add_argument('name', nargs='?', help='Client name, or backup filename for xray-backup')
     parser.add_argument('--address', help='Override the address in a share link')
     parser.add_argument('--qr', action='store_true', help='Also show a terminal QR code')
     parser.add_argument('--yes', action='store_true', help='Confirm client deletion without a prompt')
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument('--direct', action='store_true', help='Print a VLESS connection link')
+    output.add_argument('--subscription', action='store_true', help='Print the configured HTTPS subscription URL')
     args = parser.parse_args()
+    if args.subscription and args.address:
+        raise ValueError('--address changes direct links; use --direct with --address')
     command = getattr(args, 'command', command)
     if os.geteuid() != 0:
         raise ValueError('Run with sudo or as root')
     with CONFIG.with_name('.manage.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         config = json.loads(CONFIG.read_text())
+        if command == 'admin-json':
+            admin_json(config)
+            return
         if command == 'xray-backup':
             if not args.name:
                 raise ValueError('Usage: xray-backup /root/xray-config.json')
@@ -183,6 +370,26 @@ def main():
         host = args.address or settings.get('address')
         if not host:
             raise ValueError('Set the server address with xray-install --tools-only --address HOST or pass --address HOST')
+        if command == 'xray-subscription-export':
+            if not args.name:
+                raise ValueError('Usage: xray-subscription-export /root/subscriptions.json')
+            if Path(args.name).exists():
+                raise ValueError('Export file already exists; choose a new filename')
+            # One IP change on the website applies to every imported profile.
+            export_host = str(ipaddress.ip_address(host))
+            exported = {'address': export_host, 'clients': [
+                {'name': client['email'], 'token': subscription_token(settings, client),
+                 'link': share_link(config, client, host, settings.get('fingerprint', 'firefox'))}
+                for client in clients
+            ]}
+            with os.fdopen(os.open(args.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as handle:
+                json.dump(exported, handle, indent=2)
+                handle.write('\n')
+            print('Private subscription export saved. Import it through the website LAN admin panel.')
+            return
+        subscription = args.subscription or (bool(settings.get('subscriptionUrl')) and not args.direct and not args.address)
+        if subscription:
+            subscription_base(settings.get('subscriptionUrl', ''))
         if command == 'newuser':
             name = args.name or input('Client name: ').strip()
             if not name or any(c.isspace() or ord(c) < 32 for c in name):
@@ -199,9 +406,12 @@ def main():
             # Build the link before committing a change that might otherwise be unusable.
             link = share_link(config, client, host, settings.get('fingerprint', 'firefox'))
             save_change(config)
+            if subscription:
+                link = client_link(config, client, host, settings, True)
+                print('Import a new xray-subscription-export into the website before sharing this URL.', file=sys.stderr)
         else:
             client = select_client(clients, 'main' if command == 'mainuser' else args.name)
-            link = share_link(config, client, host, settings.get('fingerprint', 'firefox'))
+            link = client_link(config, client, host, settings, subscription)
         show_link(link, args.qr)
 
 

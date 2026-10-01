@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.keys
+config.json
+*.backup*
+private-backup*/
+*.tar.gz

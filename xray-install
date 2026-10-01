@@ -1,297 +1,169 @@
-#!/bin/bash
-apt update
-apt install qrencode curl jq -y
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
 
-# Включаем bbr
-bbr=$(sysctl -a | grep net.ipv4.tcp_congestion_control)
-if [ "$bbr" = "net.ipv4.tcp_congestion_control = bbr" ]; then
-echo "bbr уже включен"
-else
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-sysctl -p
-echo "bbr включен"
-fi
+usage() {
+    cat <<'HELP'
+Usage: bash xray-install --address IP_OR_HOST [--config FILE | --from USER@HOST]
+       bash xray-install --tools-only --address IP_OR_HOST
 
-# Устанавливаем ядро Xray
-bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-[ -f /usr/local/etc/xray/.keys ] && rm /usr/local/etc/xray/.keys
-touch /usr/local/etc/xray/.keys
-echo "shortsid: $(openssl rand -hex 8)" >> /usr/local/etc/xray/.keys
-echo "uuid: $(xray uuid)" >> /usr/local/etc/xray/.keys
-xray x25519 >> /usr/local/etc/xray/.keys
+Fresh installation: latest stable Xray, new credentials, XHTTP/REALITY.
+--config FILE    Restore a private config.json, preserving users and keys.
+--from USER@HOST Fetch config.json over SSH; supports SSH aliases/config.
+--address HOST   Address clients should connect to on THIS server.
+--version TAG    Install a specific Xray release instead of latest stable.
+--tools-only     Update management commands on an existing installation.
 
-export uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
-export privatkey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/PrivateKey/ {print $2}')
-export shortsid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-
-# Создаем файл конфигурации Xray
-touch /usr/local/etc/xray/config.json
-cat << EOF > /usr/local/etc/xray/config.json
-{
-    "log": {
-        "loglevel": "warning"
-    },
-    "routing": {
-        "domainStrategy": "IPIfNonMatch",
-        "rules": [
-            {
-                "type": "field",
-                "domain": [
-                    "geosite:category-ads-all"
-                ],
-                "outboundTag": "block"
-            },
-            {
-                "type": "field",
-                "ip": [
-                    "geoip:ru"
-                ],
-                "outboundTag": "block"
-            }
-        ]
-    },
-    "inbounds": [
-        {
-            "listen": "0.0.0.0",
-            "port": 443,
-            "protocol": "vless",
-            "settings": {
-                "clients": [
-                    {
-                        "email": "main",
-                        "id": "$uuid",
-                        "flow": "xtls-rprx-vision"
-                    }
-                ],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": "github.com:443",
-                    "xver": 0,
-                    "serverNames": [
-                        "github.com",
-                        "www.github.com"
-                    ],
-                    "privateKey": "$privatkey",
-                    "minClientVer": "",
-                    "maxClientVer": "",
-                    "maxTimeDiff": 0,
-                    "shortIds": [
-                        "$shortsid"
-                    ]
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "tag": "direct"
-        },
-        {
-            "protocol": "blackhole",
-            "tag": "block"
-        }
-    ],
-    "policy": {
-        "levels": {
-            "0": {
-                "handshake": 3,
-                "connIdle": 180
-            }
-        }
-    }
+Installation refuses to overwrite an existing Xray configuration.
+SSH uses normal host-key verification and keys or an interactive password.
+HELP
 }
-EOF
-
-# Исполняемый файл для списка клиентов
-touch /usr/local/bin/userlist
-cat << 'EOF' > /usr/local/bin/userlist
-#!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' "/usr/local/etc/xray/config.json"))
-
-if [[ ${#emails[@]} -eq 0 ]]; then
-    echo "Список клиентов пуст"
-    exit 1
-fi
-
-echo "Список клиентов:"
-for i in "${!emails[@]}"; do
-    echo "$((i+1)). ${emails[$i]}"
+fail() { echo "Error: $*" >&2; exit 1; }
+source_config='' source_host='' server_address='' version='' tools_only=false
+while (($#)); do
+    case "$1" in
+        --address|--config|--from|--version)
+            (($# >= 2)) || fail "Missing value for $1"
+            case "$1" in
+                --address) server_address=$2 ;;
+                --config) source_config=$2 ;;
+                --from) source_host=$2 ;;
+                --version) version=$2 ;;
+            esac
+            shift 2 ;;
+        --tools-only) tools_only=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "Unknown option: $1" ;;
+    esac
 done
-EOF
-chmod +x /usr/local/bin/userlist
-
-# исполняемый файл для ссылки основного пользователя
-touch /usr/local/bin/mainuser
-cat << 'EOF' > /usr/local/bin/mainuser
-#!/bin/bash
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
-sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(timeout 3 curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#vless-$ip"
-echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
-EOF
-chmod +x /usr/local/bin/mainuser
-
-# Исполняемый файл для создания новых клиентов
-touch /usr/local/bin/newuser
-cat << 'EOF' > /usr/local/bin/newuser
-#!/bin/bash
-read -p "Введите имя пользователя (email): " email
-
-    if [[ -z "$email" || "$email" == *" "* ]]; then
-    echo "Имя пользователя не может быть пустым или содержать пробелы. Попробуйте снова."
-    exit 1
-    fi
-user_json=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
-
-if [[ -z "$user_json" ]]; then
-uuid=$(xray uuid)
-jq --arg email "$email" --arg uuid "$uuid" '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
-systemctl restart xray
-index=$(jq --arg email "$email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
-sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
-echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
+[[ $EUID == 0 ]] || fail 'Run with sudo or as root'
+[[ -n $server_address ]] || fail '--address is required for correct client links'
+[[ -z $source_config || -z $source_host ]] || fail 'Choose --config or --from'
+if $tools_only; then
+    [[ -z $source_config && -z $source_host && -z $version ]] || fail '--tools-only cannot import or upgrade Xray'
+    [[ -s /usr/local/etc/xray/config.json ]] || fail 'Existing configuration not found'
 else
-echo "Пользователь с таким именем уже существует. Попробуйте снова." 
+    [[ ! -e /usr/local/etc/xray/config.json ]] || fail 'Configuration already exists. Use --tools-only for helpers; back up before a manual upgrade.'
 fi
-EOF
-chmod +x /usr/local/bin/newuser
+[[ -z $source_config || -f $source_config ]] || fail 'Import file not found'
+[[ -z $source_host || $source_host =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@:-]*$ ]] || fail 'Invalid SSH host or alias'
+[[ -z $version || $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Invalid release tag'
+command -v apt-get >/dev/null || fail 'This installer supports Ubuntu/Debian with systemd'
+[[ -d /run/systemd/system ]] || fail 'systemd is required'
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl python3 qrencode openssh-client unzip
 
-# Исполняемый файл для удаления клиентов
-touch /usr/local/bin/rmuser
-cat << 'EOF' > /usr/local/bin/rmuser
-#!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' "/usr/local/etc/xray/config.json"))
-
-if [[ ${#emails[@]} -eq 0 ]]; then
-    echo "Нет клиентов для удаления."
-    exit 1
-fi
-
-echo "Список клиентов:"
-for i in "${!emails[@]}"; do
-    echo "$((i+1)). ${emails[$i]}"
+stage=$(mktemp -d)
+trap 'rm -rf -- "$stage"' EXIT
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# A downloaded single script fetches its companions from the same chosen ref.
+setup_ref=${XRAY_SETUP_REF:-main}
+base="https://raw.githubusercontent.com/Emanx140/simple-xray-core/$setup_ref"
+for name in xray-manage config.example.json; do
+    if [[ -f "$script_dir/$name" ]]; then
+        cp -- "$script_dir/$name" "$stage/$name"
+    else
+        curl --fail --show-error --silent --location --retry 3 "$base/$name" -o "$stage/$name"
+    fi
 done
-
-read -p "Введите номер клиента для удаления: " choice
-
-if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#emails[@]} )); then
-    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
-    exit 1
+python3 - "$stage" "$server_address" <<'PY'
+import runpy, sys
+helper = runpy.run_path(sys.argv[1] + '/xray-manage')
+helper['address'](sys.argv[2])
+PY
+if ! $tools_only; then
+    if [[ -n $source_host ]]; then
+        ssh -- "$source_host" 'cat /usr/local/etc/xray/config.json' > "$stage/config.json"
+    elif [[ -n $source_config ]]; then
+        cp -- "$source_config" "$stage/config.json"
+    else
+        cp -- "$stage/config.example.json" "$stage/config.json"
+    fi
+    # Parse and check the supported shape before changing the destination.
+    python3 - "$stage" <<'PY'
+import json, runpy, sys
+from pathlib import Path
+stage = Path(sys.argv[1])
+config = json.loads((stage / 'config.json').read_text())
+runpy.run_path(str(stage / 'xray-manage'))['inbound'](config)
+PY
+    # Pin installer code; it resolves the latest stable core at execution time.
+    curl --fail --show-error --silent --location --retry 3 \
+        https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh \
+        -o "$stage/install-release.sh"
+    options=(install)
+    [[ -z $version ]] || options+=(--version "$version")
+    bash "$stage/install-release.sh" "${options[@]}"
+    # The upstream installer may start its empty default configuration.
+    systemctl stop xray
+    if [[ -z $source_config && -z $source_host ]]; then
+        python3 - "$stage" <<'PY'
+import json, runpy, secrets, sys, uuid
+from pathlib import Path
+stage = Path(sys.argv[1])
+helper = runpy.run_path(str(stage / 'xray-manage'))
+config = json.loads((stage / 'config.json').read_text())
+item = helper['inbound'](config)
+item['settings']['clients'][0]['id'] = str(uuid.uuid4())
+item['streamSettings']['realitySettings']['privateKey'] = helper['keypair']()[0]
+item['streamSettings']['realitySettings']['shortIds'] = [secrets.token_hex(8)]
+(stage / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
+PY
+    fi
+    # Fail rather than silently carry a source-specific listen address to a new VPS.
+    python3 - "$stage/config.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+for item in config.get('inbounds', []):
+    if item.get('listen', '0.0.0.0') not in ('0.0.0.0', '::', '127.0.0.1', '::1'):
+        raise SystemExit('Source has a specific listen address. Adapt it in a private copy and use --config.')
+PY
+    if ! xray run -test -config "$stage/config.json" > "$stage/validation.log" 2>&1; then
+        install -m 600 "$stage/validation.log" /root/xray-install-validation.log
+        fail 'Configuration validation failed. Details: /root/xray-install-validation.log. Xray remains stopped.'
+    fi
+    service_user=$(systemctl show xray --property=User --value)
+    service_user=${service_user:-root}
+    service_group=$(id -gn "$service_user")
+    install -d -m 750 -o root -g "$service_group" /usr/local/etc/xray
+    install -m 640 -o root -g "$service_group" "$stage/config.json" /usr/local/etc/xray/config.json
 fi
 
-selected_email="${emails[$((choice - 1))]}"
-
-jq --arg email "$selected_email" \
-   '(.inbounds[0].settings.clients) |= map(select(.email != $email))' \
-   "/usr/local/etc/xray/config.json" > tmp && mv tmp "/usr/local/etc/xray/config.json"
-
-systemctl restart xray
-
-echo "Клиент $selected_email удалён."
-EOF
-chmod +x /usr/local/bin/rmuser
-
-# Исполняемый файл для вывода списка пользователей и создания ссылкок
-touch /usr/local/bin/sharelink
-cat << 'EOF' > /usr/local/bin/sharelink
-#!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json))
-
-for i in "${!emails[@]}"; do
-   echo "$((i + 1)). ${emails[$i]}"
+# Back up old helpers before replacing them; never rewrite the live config here.
+backup_dir=$(mktemp -d /root/xray-tools-backup.XXXXXXXX)
+for name in xray-manage userlist mainuser newuser rmuser sharelink xray-backup; do
+    [[ ! -e /usr/local/bin/$name ]] || cp -a -- "/usr/local/bin/$name" "$backup_dir/"
 done
-
-read -p "Выберите клиента: " client
-
-if ! [[ "$client" =~ ^[0-9]+$ ]] || (( client < 1 || client > ${#emails[@]} )); then
-    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
-    exit 1
-fi
-
-selected_email="${emails[$((client - 1))]}"
-
-
-index=$(jq --arg email "$selected_email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json) 
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
-sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
-echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
-EOF
-chmod +x /usr/local/bin/sharelink
-
-systemctl restart xray
-
-echo "Xray-core успешно установлен"
-mainuser
-
-# Создаем файл с подсказками
-touch $HOME/help
-cat << 'EOF' > $HOME/help
-
-Команды для управления пользователями Xray:
-
-    mainuser - выводит ссылку для подключения основного пользователя
-    newuser - создает нового пользователя
-    rmuser - удаление пользователей
-    sharelink - выводит список пользователей и позволяет создать для них ссылки для подключения
-    userlist - выводит список клиентов
-
-
-
-Файл конфигурации находится по адресу:
-
-    /usr/local/etc/xray/config.json
-
-Команда для перезагрузки ядра Xray:
-
+[[ ! -e /usr/local/etc/xray/share-settings.json ]] || cp -a /usr/local/etc/xray/share-settings.json "$backup_dir/"
+install -m 755 "$stage/xray-manage" /usr/local/bin/xray-manage
+for name in userlist mainuser newuser rmuser sharelink xray-backup; do
+    ln -sfn /usr/local/bin/xray-manage "/usr/local/bin/$name"
+done
+python3 - "$server_address" <<'PY'
+import json, os, sys
+from pathlib import Path
+path = Path('/usr/local/etc/xray/share-settings.json')
+settings = json.loads(path.read_text()) if path.exists() else {'fingerprint': 'firefox'}
+settings['address'] = sys.argv[1]
+path.write_text(json.dumps(settings, indent=2) + '\n')
+os.chmod(path, 0o600)
+PY
+if ! $tools_only; then
+    port=$(python3 -c 'import json; c=json.load(open("/usr/local/etc/xray/config.json")); print(next(i["port"] for i in c["inbounds"] if i.get("protocol")=="vless"))')
+    if command -v ufw >/dev/null && LC_ALL=C ufw status | grep -q '^Status: active'; then
+        ufw allow "$port/tcp"
+    fi
+    # BBR is optional: some VPS kernels do not expose the necessary sysctls.
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-xray-bbr.conf
+        sysctl -p /etc/sysctl.d/99-xray-bbr.conf || echo 'BBR could not be enabled on this VPS kernel.' >&2
+    fi
+    systemctl enable xray
     systemctl restart xray
-
-EOF
+    sleep 1
+    systemctl is-active --quiet xray || fail 'Xray did not stay running; inspect journalctl -u xray'
+    echo "Xray is running. Allow TCP $port in the VPS provider firewall as well."
+fi
+printf 'Management commands installed. Previous helpers: %s\n' "$backup_dir"
+printf 'Use userlist, mainuser --qr, newuser NAME, sharelink NAME --qr, rmuser NAME, or xray-backup FILE.\n'

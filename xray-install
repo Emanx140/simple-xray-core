@@ -7,7 +7,7 @@ usage() {
 Usage: bash xray-install --address IP_OR_HOST [--config FILE | --from USER@HOST]
        bash xray-install --tools-only --address IP_OR_HOST
 
-Fresh installation: latest stable Xray, new credentials, XHTTP/REALITY.
+Fresh installation: OS package updates, latest stable Xray, XHTTP/REALITY.
 --config FILE    Restore a private config.json, preserving users and keys.
 --from USER@HOST Fetch config.json over SSH; supports SSH aliases/config.
 --address HOST   Address clients should connect to on THIS server.
@@ -50,9 +50,18 @@ fi
 [[ -z $version || $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Invalid release tag'
 command -v apt-get >/dev/null || fail 'This installer supports Ubuntu/Debian with systemd'
 [[ -d /run/systemd/system ]] || fail 'systemd is required'
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y ca-certificates curl python3 qrencode openssh-client unzip
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+apt-get -o DPkg::Lock::Timeout=300 update
+if ! $tools_only; then
+    # Update the installed OS release before deploying Xray. Preserve local
+    # configuration files when dpkg cannot resolve a conffile automatically.
+    apt-get -o DPkg::Lock::Timeout=300 \
+        -o APT::Get::Always-Include-Phased-Updates=true \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold -y dist-upgrade
+    dpkg --audit
+fi
+apt-get -o DPkg::Lock::Timeout=300 install -y ca-certificates curl python3 qrencode openssh-client unzip
 
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
@@ -167,3 +176,6 @@ if ! $tools_only; then
 fi
 printf 'Management commands installed. Previous helpers: %s\n' "$backup_dir"
 printf 'Use userlist, mainuser --qr, newuser NAME, sharelink NAME --qr, rmuser NAME, or xray-backup FILE.\n'
+if ! $tools_only && [[ -f /var/run/reboot-required ]]; then
+    echo 'OS updates require a reboot. Xray is enabled at boot; reboot this VPS, then verify the service and client connection.'
+fi

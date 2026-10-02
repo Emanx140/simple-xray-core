@@ -5,3 +5,11 @@ config.json
 *.backup*
 private-backup*/
 *.tar.gz
+**/bin/
+**/obj/
+**/data/
+subscriptions*.json
+fleet.json
+fleet.json.*
+id_ed25519*
+known_hosts
